@@ -96,3 +96,54 @@ test("a routine whose ask the gateway denies is not retried that day", async () 
     store.close();
     rmSync(dir, { recursive: true, force: true });
 });
+
+test("the tools take every schedule form, cron_look shows each as stored with its next run, and a one-off ends as ran", async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.UTC(2026, 9, 9, 12, 0) }); // Friday 15:00 in Kyiv
+    const notices: unknown[] = [];
+    const rt = { ...packRuntime(), notify: (notice: unknown) => void notices.push(notice) } as PackRuntime;
+    const pack = cronsPack({ tz: "Europe/Kyiv", run: async (job) => `done: ${job.id}` });
+    const stop = pack.start!(rt);
+    t.after(() => {
+        stop?.();
+        rmSync(rt.dataDir, { recursive: true, force: true });
+    });
+    const call = async (name: string, args: Record<string, unknown>): Promise<unknown> =>
+        pack.tools.find((tool) => tool.definition.function.name === name)!.execute(args);
+
+    assert.equal(
+        await call("cron_add", { title: "Standup", when: "MON-Fri 08:00", instruction: "plan the day" }),
+        'Added "standup": mon-fri 08:00, next run 2026-10-12 08:00.',
+    );
+    assert.equal(
+        await call("cron_add", { title: "Trip", when: "2026-10-10 15:00", instruction: "remind me to pack", notify: true }),
+        'Added "trip": 2026-10-10 15:00, next run 2026-10-10 15:00.',
+    );
+    assert.equal(
+        await call("cron_add", { title: "Diary", when: "21:00", instruction: "ask about the day" }),
+        'Added "diary": 21:00, next run 2026-10-09 21:00.',
+    );
+    assert.match(
+        String(await call("cron_add", { title: "Late", when: "2026-10-08 09:00", instruction: "x" })),
+        /^Error: "2026-10-08 09:00" has already passed \(now 2026-10-09 15:00 Europe\/Kyiv\)/,
+    );
+    assert.match(
+        String(await call("cron_add", { title: "Bad", when: "tues 08:00", instruction: "x" })),
+        /^Error: bad schedule "tues 08:00" — use "HH:MM"/,
+    );
+    assert.equal(await call("cron_edit", { id: "diary", when: "Sun 20:00" }), 'Updated "diary": sun 20:00, next run 2026-10-11 20:00.');
+    assert.equal(
+        await call("cron_look", {}),
+        [
+            "on  mon-fri 08:00 standup — Standup · next 2026-10-12 08:00",
+            "on  2026-10-10 15:00 trip — Trip (notifies) · next 2026-10-10 15:00",
+            "on  sun 20:00 diary — Diary · next 2026-10-11 20:00",
+        ].join("\n"),
+    );
+
+    t.mock.timers.setTime(Date.UTC(2026, 9, 10, 11, 59)); // Saturday 14:59 in Kyiv
+    t.mock.timers.tick(60_000);
+    for (let i = 0; i < 50; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(notices, [{ title: "Trip", body: "done: trip" }]);
+    assert.match(String(await call("cron_look", {})), /^off 2026-10-10 15:00 trip — Trip \(notifies\) · ran$/m);
+    assert.equal(await call("cron_edit", { id: "trip", title: "Trip home" }), 'Updated "trip": 2026-10-10 15:00 (off).');
+});

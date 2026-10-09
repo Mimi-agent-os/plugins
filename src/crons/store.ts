@@ -6,11 +6,14 @@ import { DatabaseSync } from "node:sqlite";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 
+import { parseWhen } from "./schedule.ts";
+
 export interface CronJob {
     /** short slug, ^[a-z0-9][a-z0-9_-]{0,63}$ — stable key the tools and the last-run mark share. */
     id: string;
     title: string;
-    /** "HH:MM", 24h, fires daily at this wall-clock time in the engine's timezone. */
+    /** The schedule, in the engine's timezone: "HH:MM" every day, "mon-fri 08:00" on days of the week, or
+     *  "2026-10-10 15:00" once (schedule.ts owns the grammar); the store keeps it normalized. */
     when: string;
     instruction: string;
     /** true → the run's result is pushed to the owner; false → only logged. */
@@ -29,7 +32,8 @@ export interface CronStore {
     /** Add `jobs` in one transaction unless this database was seeded before; true when it seeded.
      *  A removed default never comes back. */
     seedIfFresh(jobs: CronJob[]): boolean;
-    /** The day-string ("YYYY-MM-DD") this job last settled — ran, gave up, or was set past its time — or null. */
+    /** The day-string ("YYYY-MM-DD") this job last settled — ran, gave up, or was set past its time — or null.
+     *  A one-off is stamped only by its own run, with its moment ("YYYY-MM-DD HH:MM"). */
     lastRun(id: string): string | null;
     /** null clears the mark, as if the job never settled. */
     setLastRun(id: string, day: string | null): void;
@@ -37,16 +41,12 @@ export interface CronStore {
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const WHEN_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 // the gateway refuses a notice whose trimmed title is outside this, and the title heads every notice
 const TITLE_MAX = 200;
 
 function assertId(id: string): void {
     if (!ID_RE.test(id))
         throw new Error(`bad cron id "${id}" — use a slug like "morning-brief" (lowercase letters, digits, - or _, up to 64 chars).`);
-}
-function assertWhen(when: string): void {
-    if (!WHEN_RE.test(when)) throw new Error(`bad time "${when}" — use 24h "HH:MM", e.g. "08:00" or "21:30".`);
 }
 function assertTitle(title: string): void {
     const n = title.trim().length;
@@ -97,8 +97,9 @@ export class SqliteCronStore implements CronStore {
     }
 
     list(): CronJob[] {
-        const rows = this.db.prepare("SELECT * FROM jobs ORDER BY run_at, id").all() as unknown as Row[];
-        return rows.map(toJob);
+        const rows = this.db.prepare("SELECT * FROM jobs ORDER BY id").all() as unknown as Row[];
+        // by time of day, then id: the engine runs the jobs due together in this order
+        return rows.map(toJob).sort((a, b) => parseWhen(a.when).minutes - parseWhen(b.when).minutes);
     }
 
     get(id: string): CronJob | null {
@@ -109,20 +110,20 @@ export class SqliteCronStore implements CronStore {
     add(job: CronJob): CronJob {
         assertId(job.id);
         assertTitle(job.title);
-        assertWhen(job.when);
+        const when = parseWhen(job.when).when;
         if (this.get(job.id)) throw new Error(`a cron job "${job.id}" already exists.`);
         this.db
             .prepare("INSERT INTO jobs (id, title, run_at, instruction, notify, enabled, catch_up) VALUES (?, ?, ?, ?, ?, ?, ?)")
-            .run(job.id, job.title, job.when, job.instruction, job.notify ? 1 : 0, job.enabled ? 1 : 0, job.catchUp ? 1 : 0);
-        return job;
+            .run(job.id, job.title, when, job.instruction, job.notify ? 1 : 0, job.enabled ? 1 : 0, job.catchUp ? 1 : 0);
+        return { ...job, when };
     }
 
     update(id: string, patch: Partial<CronJob>): CronJob | null {
         const current = this.get(id);
         if (!current) return null;
         if (patch.title !== undefined) assertTitle(patch.title);
-        if (patch.when !== undefined) assertWhen(patch.when);
-        const next: CronJob = { ...current, ...patch, id }; // id is the key, never rewritten by a patch
+        const when = patch.when === undefined ? current.when : parseWhen(patch.when).when;
+        const next: CronJob = { ...current, ...patch, id, when }; // id is the key, never rewritten by a patch
         this.db
             .prepare("UPDATE jobs SET title = ?, run_at = ?, instruction = ?, notify = ?, enabled = ?, catch_up = ? WHERE id = ?")
             .run(next.title, next.when, next.instruction, next.notify ? 1 : 0, next.enabled ? 1 : 0, next.catchUp ? 1 : 0, id);

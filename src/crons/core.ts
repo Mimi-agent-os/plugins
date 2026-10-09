@@ -1,12 +1,21 @@
 /** The deterministic half of the crons pack: a once-a-minute check that fires due jobs THROUGH an
- *  injected `fire` (the host's routine runner), gated once-per-day, timezone-aware, with boot catch-up.
+ *  injected `fire` (the host's routine runner), timezone-aware, with boot catch-up. A daily or weekday
+ *  job runs at most once a day; a one-off runs once and then turns itself off.
  *  No LLM, no agent coupling, no I/O of its own — the store and the fire/notify sinks are all passed in.
  *  Jobs run serially so an earlier one finishes before a later; a failed job retries with growing
- *  pauses up to a daily cap, and its day is stamped once it succeeds or gives up. */
+ *  pauses up to a daily cap, and its day (a one-off's moment) is stamped once it succeeds or gives up. */
 
+import { firesOn, nextRun, parseWhen } from "./schedule.ts";
 import type { CronJob, CronStore } from "./store.ts";
 
 export type { CronJob, CronStore } from "./store.ts";
+
+export interface ListedJob extends CronJob {
+    /** Local "YYYY-MM-DD HH:MM" of the next scheduled run; null while the job is off. */
+    next: string | null;
+    /** A one-off that has had its run at its stored moment, whatever the outcome; re-timing it clears this. */
+    ran: boolean;
+}
 
 export interface CronsOptions {
     store: CronStore;
@@ -15,7 +24,7 @@ export interface CronsOptions {
     /** Runs the job and resolves with the result text. `job.instruction` arrives prefixed with the run's
      *  clock and, on a retry, its attempt number; a rejection whose `status` is "denied" is not retried that day. */
     fire: (job: CronJob) => Promise<string>;
-    /** Deliver a run's result (or a failure notice) to the owner. */
+    /** Deliver a run's result (or a failure or missed one-off notice) to the owner. */
     notify: (job: CronJob, result: string) => void;
     /** False while the agent's gateway session is down; ticks (and the boot catch-up) wait for it. */
     connected: () => boolean;
@@ -27,9 +36,11 @@ export interface CronsOptions {
 export interface Crons {
     /** Start the minute timer and run one immediate catch-up tick; returns a stop fn that clears it. */
     start(): () => void;
-    list(): CronJob[];
-    add(job: CronJob): CronJob;
-    edit(id: string, patch: Partial<CronJob>): CronJob | null;
+    list(): ListedJob[];
+    /** Adding or editing a one-off to a moment already past throws, unless it is earlier today and
+     *  catchUp runs it at once. */
+    add(job: CronJob): ListedJob;
+    edit(id: string, patch: Partial<CronJob>): ListedJob | null;
     remove(id: string): boolean;
     /** Add `jobs` once per database, the first time it is opened. */
     seed(jobs: CronJob[]): void;
@@ -73,11 +84,12 @@ export function createCrons(opts: CronsOptions): Crons {
     const inFlight = new Set<string>(); // shared by the schedule and runNow, so one job never runs twice at once
     let stopped = false;
 
-    // a job put at a time already gone today waits for tomorrow; one put ahead again runs at its new time
+    // a repeating job put at a time already gone today waits for its next day; one put ahead again runs at its new time
     const holdIfPassed = (job: CronJob): void => {
+        const s = parseWhen(job.when);
         const { day, minutes } = clock();
         const hold = held.get(job.id);
-        if (Number(job.when.slice(0, 2)) * 60 + Number(job.when.slice(3)) < minutes) {
+        if (s.kind !== "once" && firesOn(s, day) && s.minutes < minutes) {
             if (hold?.day !== day) held.set(job.id, { day, prev: store.lastRun(job.id) });
             store.setLastRun(job.id, day);
             return;
@@ -86,6 +98,38 @@ export function createCrons(opts: CronsOptions): Crons {
         if (hold?.day !== day) return;
         held.delete(job.id);
         store.setLastRun(job.id, hold.prev);
+    };
+
+    // an add or edit that arms a one-off needs its moment ahead, or earlier today with catchUp on to run it at once
+    const assertAhead = (job: CronJob, was: CronJob | null): void => {
+        const s = parseWhen(job.when);
+        if (s.kind !== "once" || !job.enabled || (was?.enabled && was.when === s.when)) return;
+        const { day, time, minutes } = clock();
+        if (s.date > day || (s.date === day && (s.minutes >= minutes || job.catchUp))) return;
+        throw new Error(
+            `"${s.when}" has already passed (now ${day} ${time} ${zone}) — a one-off needs a moment ahead; ` +
+                "one earlier today is accepted with catchUp on and runs at once.",
+        );
+    };
+
+    const listed = (job: CronJob): ListedJob => {
+        const s = parseWhen(job.when);
+        const { day } = clock();
+        const mark = store.lastRun(job.id);
+        return {
+            ...job,
+            next: job.enabled ? nextRun(s, day, mark === day || skipped.has(job.id)) : null,
+            ran: s.kind === "once" && mark === s.when,
+        };
+    };
+
+    // a run settled: a one-off is stamped with its moment and turns off, unless the owner re-timed it while it ran
+    const settle = (job: CronJob, day: string): void => {
+        const once = parseWhen(job.when).kind === "once";
+        retries.delete(job.id);
+        held.delete(job.id);
+        store.setLastRun(job.id, once ? job.when : day);
+        if (once && store.get(job.id)?.when === job.when) store.update(job.id, { enabled: false });
     };
 
     const runScheduled = async (job: CronJob, day: string): Promise<void> => {
@@ -99,9 +143,7 @@ export function createCrons(opts: CronsOptions): Crons {
         try {
             const result = await fire({ ...job, instruction: `${header}\n\n${job.instruction}` });
             if (stopped) return; // the store is closed once the pack stops
-            retries.delete(job.id);
-            held.delete(job.id);
-            store.setLastRun(job.id, day);
+            settle(job, day);
             if (job.notify) notify(job, result);
             else log(`${job.id}: ${result}\n`);
         } catch (e) {
@@ -112,10 +154,9 @@ export function createCrons(opts: CronsOptions): Crons {
             const nextAt = pause === undefined ? null : now() + pause * 60_000;
             // a retry that would land tomorrow is dropped there, so it gives the day up here instead
             if ((e as { status?: unknown }).status === "denied" || nextAt === null || clock(nextAt).day !== day) {
-                retries.delete(job.id);
-                held.delete(job.id);
-                store.setLastRun(job.id, day);
-                notify(job, `This routine failed on attempt ${attempt} and will not run again today: ${msg}`);
+                settle(job, day);
+                const again = parseWhen(job.when).kind === "once" ? "" : " today";
+                notify(job, `This routine failed on attempt ${attempt} and will not run again${again}: ${msg}`);
                 return;
             }
             retries.set(job.id, { day, attempts: attempt, nextAt });
@@ -128,9 +169,14 @@ export function createCrons(opts: CronsOptions): Crons {
     let ticking = false;
     let booted = false; // set once a connected pass has checked every job; a pass the link cut short is still the boot pass
     let skipDay = "";
+    let liveSince = ""; // day of the pass that began this connected stretch: a one-off due since then runs late, not missed
 
     const tick = async (): Promise<void> => {
-        if (ticking || stopped || !connected()) return; // never overlap a long routine; boot waits for a connection
+        if (ticking || stopped) return; // never overlap a long routine
+        if (!connected()) {
+            liveSince = ""; // boot waits for a connection, and what falls due meanwhile was missed offline
+            return;
+        }
         ticking = true;
         try {
             const { day, minutes } = clock();
@@ -138,18 +184,39 @@ export function createCrons(opts: CronsOptions): Crons {
                 skipped.clear();
                 skipDay = day;
             }
-            // store.list() is ordered by `when`, so an earlier job finishes before a later one starts
+            liveSince ||= day;
+            // store.list() is ordered by time of day, so an earlier job finishes before a later one starts
             for (const job of store.list()) {
                 if (stopped || !connected()) return; // the link can drop while an earlier job runs
-                if (!job.enabled || skipped.has(job.id) || inFlight.has(job.id) || store.lastRun(job.id) === day) continue;
+                if (!job.enabled || skipped.has(job.id) || inFlight.has(job.id)) continue;
                 const retry = retries.get(job.id);
                 if (retry?.day === day && now() < retry.nextAt) continue;
-                if (minutes < Number(job.when.slice(0, 2)) * 60 + Number(job.when.slice(3))) continue;
-                if (!booted && !job.catchUp) {
-                    skipped.add(job.id); // its time passed while the process was down and it opted out of catch-up
-                    continue;
+                const s = parseWhen(job.when);
+                if (s.kind === "once") {
+                    // a one-off is gated by its on/off switch, which its run turns off
+                    if (s.date > day || (s.date === day && minutes < s.minutes)) continue;
+                    if (s.date < liveSince || (!booted && !job.catchUp)) {
+                        // it fell due, or was due to retry, while the agent was down and can no longer catch up: reported, never dropped
+                        if (retry?.day === s.date) {
+                            settle(job, s.date);
+                            notify(
+                                job,
+                                `This routine failed on attempt ${retry.attempts} and will not run again: the agent was offline when it was due to retry.`,
+                            );
+                        } else {
+                            store.update(job.id, { enabled: false });
+                            notify(job, `This one-off was due at ${s.when} ${zone} and was missed while the agent was offline. It is now off.`);
+                        }
+                        continue;
+                    }
+                } else {
+                    if (store.lastRun(job.id) === day || !firesOn(s, day) || minutes < s.minutes) continue;
+                    if (!booted && !job.catchUp) {
+                        skipped.add(job.id); // its time passed while the process was down and it opted out of catch-up
+                        continue;
+                    }
                 }
-                await runScheduled(job, day);
+                await runScheduled(job, s.kind === "once" ? s.date : day); // a one-off's attempts belong to its own date
             }
             booted = true;
         } catch (e) {
@@ -168,16 +235,21 @@ export function createCrons(opts: CronsOptions): Crons {
                 clearInterval(timer);
             };
         },
-        list: () => store.list(),
+        list: () => store.list().map(listed),
         add: (job) => {
+            assertAhead(job, null);
             const added = store.add(job);
             holdIfPassed(added);
-            return added;
+            return listed(added);
         },
         edit: (id, patch) => {
+            const was = store.get(id);
+            if (!was) return null;
+            assertAhead({ ...was, ...patch }, was);
             const next = store.update(id, patch);
-            if (next && (patch.when !== undefined || patch.enabled !== undefined)) holdIfPassed(next);
-            return next;
+            if (!next) return null;
+            if (patch.when !== undefined || patch.enabled !== undefined) holdIfPassed(next);
+            return listed(next);
         },
         remove: (id) => {
             retries.delete(id);
@@ -197,11 +269,7 @@ export function createCrons(opts: CronsOptions): Crons {
                 .then(
                     (result) => {
                         // a manual success settles a scheduled run that failed today, so its retry does not run it again
-                        if (!stopped && retries.get(id)?.day === day) {
-                            retries.delete(id);
-                            held.delete(id);
-                            store.setLastRun(id, day);
-                        }
+                        if (!stopped && retries.get(id)?.day === day) settle(job, day);
                         notify(job, result);
                     },
                     (e: unknown) => notify(job, `This routine failed: ${(e as Error).message}`),

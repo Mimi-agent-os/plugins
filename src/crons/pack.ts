@@ -18,32 +18,40 @@ export type { CronJob } from "./store.ts";
 
 const SKILL = `# Your schedule (crons)
 
-You run on a schedule you can see and change. Each routine is a cron: a daily wall-clock time and a
-plain instruction you carry out when it fires.
+You run on a schedule you can see and change. Each routine is a cron: when it fires (every day, on some
+days of the week, or once) and a plain instruction you carry out when it does.
 
-- \`cron_look\` — see every routine: its id, time, on/off, whether it notifies, and its title.
+- \`cron_look\` — see every routine: on/off, its schedule, id, title, whether it notifies, and its next run.
 - \`cron_add\` / \`cron_edit\` / \`cron_remove\` — shape the schedule.
 - \`cron_run_now\` — start one now, ignoring its time (useful to test a routine or re-run a failed one;
   a successful re-run of one that failed today counts as today's run); its result arrives in the owner's Inbox.
 
 Each field:
-- **when** — 24h \`"HH:MM"\`, fired once a day at that time in the owner's timezone.
+- **when** — a 24h time in the owner's timezone: \`"08:00"\` every day; days of the week then a time, as in
+  \`"mon-fri 08:00"\`, \`"sat,sun 10:00"\` or \`"mon,wed,fri 07:30"\`; or a date then a time, \`"2026-10-10 15:00"\`,
+  for a one-off. A one-off runs once and then turns itself off; it stays listed, marked as ran. It must lie
+  ahead, or earlier today with catchUp on, which runs it at once. Re-timing a one-off keeps it on or off, so one
+  that has run needs enabled true as well to run again.
 - **notify** — true pushes the result to the owner's Inbox; false only logs it. A failed routine
   retries a few times that day with growing pauses, and the owner hears of its first failure and of
   giving up either way.
 - **catchUp** — if the process was down when a routine's time passed, true makes it up on the next
-  start; false skips it until the next day.
+  start the same day; false skips it until its next day. A one-off that cannot be made up is turned off,
+  and the owner is told it was missed.
 - **enabled** — false pauses a routine without deleting it.
 
 Changing the schedule is a real change to how you act every day, so confirm the owner's intent before
 you add, edit, or remove a routine — do not reshape it on a vague hint. Routines only fire while the
-process is alive; a routine you add, re-time or re-enable takes effect from the next time its clock
-comes round.`;
+process is alive; a repeating routine you add, re-time or re-enable takes effect from the next time its
+clock comes round.`;
 
 type Args = Record<string, unknown>;
 const str = (a: Args, k: string): string | undefined => (typeof a[k] === "string" ? (a[k] as string) : undefined);
 const bool = (a: Args, k: string): boolean | undefined => (typeof a[k] === "boolean" ? (a[k] as boolean) : undefined);
 const NOT_STARTED = "Error: scheduler not started yet.";
+const WHEN =
+    '24h, the agent\'s timezone: "HH:MM" every day; days then a time on those days ("mon-fri 08:00", "sat,sun 10:00", ' +
+    '"mon,wed,fri 07:30"); or "YYYY-MM-DD HH:MM" once';
 
 export function cronsPack(opts: {
     tz?: string | undefined;
@@ -56,31 +64,40 @@ export function cronsPack(opts: {
     const tools = [
         defineTool(
             "cron_look",
-            "List the scheduled routines (crons): each one's id, time, on/off, whether it notifies, and its title.",
+            "List the scheduled routines (crons): each one's on/off, schedule, id, title, whether it notifies, and its next " +
+                "run; a one-off that has had its run is marked as ran.",
             { type: "object", properties: {} },
             () => {
                 if (!engine) return NOT_STARTED;
                 const jobs = engine.list();
                 if (jobs.length === 0) return "No cron jobs.";
                 return jobs
-                    .map((j) => `${j.enabled ? "on " : "off"} ${j.when} ${j.id} — ${j.title}${j.notify ? " (notifies)" : ""}`)
+                    .map((j) => {
+                        const after = j.next ? ` · next ${j.next}` : j.ran ? " · ran" : "";
+                        return `${j.enabled ? "on " : "off"} ${j.when} ${j.id} — ${j.title}${j.notify ? " (notifies)" : ""}${after}`;
+                    })
                     .join("\n");
             },
         ),
         defineTool(
             "cron_add",
-            "Add a scheduled routine. `when` is 24h \"HH:MM\", fired daily in the agent's timezone; `instruction` is " +
-                "the plain-language task the routine runs. Confirm intent with the owner first — this changes the schedule.",
+            "Add a scheduled routine. `when` is \"HH:MM\" every day, days of the week then a time (\"mon-fri 08:00\"), or " +
+                "\"YYYY-MM-DD HH:MM\" once; a one-off runs once, then turns off, and must lie ahead, or earlier today with " +
+                "catchUp on (the default), which runs it at once. `instruction` is the plain-language task the routine runs. " +
+                "Confirm intent with the owner first — this changes the schedule.",
             {
                 type: "object",
                 properties: {
                     id: { type: "string", description: "optional short slug; derived from the title if omitted" },
                     title: { type: "string" },
-                    when: { type: "string", description: '24h "HH:MM"' },
+                    when: { type: "string", description: WHEN },
                     instruction: { type: "string" },
                     notify: { type: "boolean", description: "push the result to the owner (default false — result is only logged)" },
                     enabled: { type: "boolean", description: "default true" },
-                    catchUp: { type: "boolean", description: "make up a run missed while the process was down (default true)" },
+                    catchUp: {
+                        type: "boolean",
+                        description: "make up, the same day, a run missed while the process was down (default true)",
+                    },
                 },
                 required: ["title", "when", "instruction"],
             },
@@ -101,7 +118,7 @@ export function cronsPack(opts: {
                         enabled: bool(a, "enabled") ?? true,
                         catchUp: bool(a, "catchUp") ?? true,
                     });
-                    return `Added "${job.id}" at ${job.when}${job.enabled ? "" : " (disabled)"}.`;
+                    return `Added "${job.id}": ${job.when}${job.next ? `, next run ${job.next}` : " (off)"}.`;
                 } catch (e) {
                     return `Error: ${(e as Error).message}`;
                 }
@@ -110,13 +127,15 @@ export function cronsPack(opts: {
         ),
         defineTool(
             "cron_edit",
-            "Change fields of an existing routine — pass its id and only the fields to change. Confirm intent with the owner.",
+            "Change fields of an existing routine — pass its id and only the fields to change. Re-timing a one-off keeps " +
+                "it on or off, so one that has run needs enabled true as well to run again; one turned on, or re-timed while " +
+                "on, must lie ahead, or earlier today with catchUp on, which runs it at once. Confirm intent with the owner.",
             {
                 type: "object",
                 properties: {
                     id: { type: "string" },
                     title: { type: "string" },
-                    when: { type: "string", description: '24h "HH:MM"' },
+                    when: { type: "string", description: WHEN },
                     instruction: { type: "string" },
                     notify: { type: "boolean" },
                     enabled: { type: "boolean", description: "false pauses the routine without deleting it" },
@@ -144,7 +163,8 @@ export function cronsPack(opts: {
                 if (Object.keys(patch).length === 0) return "Error: nothing to change — pass a field to edit.";
                 try {
                     const job = engine.edit(id, patch);
-                    return job ? `Updated "${job.id}".` : `Error: no cron job "${id}".`;
+                    if (!job) return `Error: no cron job "${id}".`;
+                    return `Updated "${job.id}": ${job.when}${job.next ? `, next run ${job.next}` : " (off)"}.`;
                 } catch (e) {
                     return `Error: ${(e as Error).message}`;
                 }

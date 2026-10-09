@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Mimi-agent-os/plugins/actions/workflows/ci.yml/badge.svg)](https://github.com/Mimi-agent-os/plugins/actions/workflows/ci.yml)
 
-Ready-made features for mimi-os agents: long-term memory, a wiki of topic pages and daily routines.
+Ready-made features for mimi-os agents: long-term memory, a wiki of topic pages and scheduled routines.
 You add them to an agent written with the sdk, one line each, in `runAgent({ packs })`.
 mimi-os is a personal agent runtime (a gateway, agents and an app); this package builds on sdk and protocol.
 
@@ -15,8 +15,8 @@ data folder under the agent.
 
 - [`memory()`](src/memory/README.md#memory): short facts kept whole on every prompt; tools `remember`, `forget`.
 - [`wiki()`](src/memory/README.md#wiki): topic pages the model loads on demand; tools `wiki_read`, `wiki_write`.
-- [`cron({ tz, jobs, run })`](src/crons/README.md): daily `HH:MM` routines the model can list and edit;
-  tools `cron_look`, `cron_add`, `cron_edit`, `cron_remove`, `cron_run_now`.
+- [`cron({ tz, jobs, run })`](src/crons/README.md): routines that run every day, on days of the week or once,
+  which the model can list and edit; tools `cron_look`, `cron_add`, `cron_edit`, `cron_remove`, `cron_run_now`.
 
 ## Where it sits
 

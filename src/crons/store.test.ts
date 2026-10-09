@@ -36,12 +36,24 @@ test("add / get / update / remove round-trip", () => {
     store.close();
 });
 
-test("list is ordered by time then id", () => {
+test("list is ordered by time of day then id, whatever the kind of schedule", () => {
     const store = new SqliteCronStore(":memory:");
     store.add(job({ id: "review", when: "21:00" }));
-    store.add(job({ id: "cut", when: "07:55" }));
+    store.add(job({ id: "trip", when: "2026-01-01 08:00" }));
+    store.add(job({ id: "cut", when: "mon-fri 07:55" }));
     store.add(job({ id: "brief", when: "08:00" }));
-    assert.deepEqual(store.list().map((j) => j.id), ["cut", "brief", "review"]);
+    assert.deepEqual(store.list().map((j) => j.id), ["cut", "brief", "trip", "review"]);
+    store.close();
+});
+
+test("a schedule is stored normalized, on add and on update", () => {
+    const store = new SqliteCronStore(":memory:");
+    assert.equal(store.add(job({ when: "MON-Fri 08:00" })).when, "mon-fri 08:00");
+    assert.equal(store.get("brief")?.when, "mon-fri 08:00");
+    assert.equal(store.update("brief", { when: "Sun, sat 10:00" })?.when, "sat,sun 10:00");
+    assert.equal(store.update("brief", { when: "mon-sun 06:00" })?.when, "06:00");
+    assert.equal(store.update("brief", { when: " 2026-10-10 15:00 " })?.when, "2026-10-10 15:00");
+    assert.equal(store.get("brief")?.when, "2026-10-10 15:00");
     store.close();
 });
 
@@ -54,17 +66,19 @@ test("a patch never rewrites the id", () => {
     store.close();
 });
 
-test("validation rejects a bad id and a bad time", () => {
+test("validation rejects a bad id and a bad schedule", () => {
     const store = new SqliteCronStore(":memory:");
     assert.throws(() => store.add(job({ id: "Bad Id" })), /bad cron id/);
     assert.throws(() => store.add(job({ id: "" })), /bad cron id/);
-    assert.throws(() => store.add(job({ when: "24:00" })), /bad time/);
-    assert.throws(() => store.add(job({ when: "8:00" })), /bad time/);
-    assert.throws(() => store.add(job({ when: "08:60" })), /bad time/);
+    assert.throws(() => store.add(job({ when: "24:00" })), /bad schedule/);
+    assert.throws(() => store.add(job({ when: "8:00" })), /bad schedule/);
+    assert.throws(() => store.add(job({ when: "08:60" })), /bad schedule/);
+    assert.throws(() => store.add(job({ when: "weekdays 08:00" })), /bad schedule/);
 
     store.add(job());
     assert.throws(() => store.add(job()), /already exists/);
-    assert.throws(() => store.update("brief", { when: "nope" }), /bad time/);
+    assert.throws(() => store.update("brief", { when: "nope" }), /bad schedule/);
+    assert.equal(store.get("brief")?.when, "08:00");
     store.close();
 });
 
